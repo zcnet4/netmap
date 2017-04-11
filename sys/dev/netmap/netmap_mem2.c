@@ -255,7 +255,7 @@ static struct netmap_mem_d *netmap_last_mem_d = &nm_mem;
 NM_MTX_T nm_mem_list_lock;
 
 struct netmap_mem_d *
-netmap_mem_get(struct netmap_mem_d *nmd)
+__netmap_mem_get(struct netmap_mem_d *nmd, const char *func, int line)
 {
 	NM_MTX_LOCK(nm_mem_list_lock);
 	nmd->refcount++;
@@ -265,7 +265,7 @@ netmap_mem_get(struct netmap_mem_d *nmd)
 }
 
 void
-netmap_mem_put(struct netmap_mem_d *nmd)
+__netmap_mem_put(struct netmap_mem_d *nmd, const char *func, int line)
 {
 	int last;
 	NM_MTX_LOCK(nm_mem_list_lock);
@@ -524,6 +524,7 @@ nm_mem_assign_id_locked(struct netmap_mem_d *nmd)
 			scan->prev = nmd;
 			netmap_last_mem_d = nmd;
 			nmd->refcount = 1;
+			NM_DBG_REFC(nmd, __FUNCTION__, __LINE__);
 			error = 0;
 			break;
 		}
@@ -568,6 +569,7 @@ netmap_mem_find(nm_memid_t id)
 	do {
 		if (!(nmd->flags & NETMAP_MEM_HIDDEN) && nmd->nm_id == id) {
 			nmd->refcount++;
+			NM_DBG_REFC(nmd, __FUNCTION__, __LINE__);
 			NM_MTX_UNLOCK(nm_mem_list_lock);
 			return nmd;
 		}
@@ -1867,19 +1869,14 @@ struct netmap_mem_ops netmap_mem_global_ops = {
 };
 
 int
-netmap_mem_pools_info_get(struct nmreq *nmr, struct netmap_adapter *na)
+netmap_mem_pools_info_get(struct nmreq *nmr, struct netmap_mem_d *nmd)
 {
 	uintptr_t *pp = (uintptr_t *)&nmr->nr_arg1;
 	struct netmap_pools_info *upi = (struct netmap_pools_info *)(*pp);
-	struct netmap_mem_d *nmd = na->nm_mem;
 	struct netmap_pools_info pi;
 	unsigned int memsize;
 	uint16_t memid;
 	int ret;
-
-	if (!nmd) {
-		return -1;
-	}
 
 	ret = netmap_mem_get_info(nmd, &memsize, NULL, &memid);
 	if (ret) {
@@ -1888,6 +1885,7 @@ netmap_mem_pools_info_get(struct nmreq *nmr, struct netmap_adapter *na)
 
 	pi.memsize = memsize;
 	pi.memid = memid;
+	NMA_LOCK(nmd);
 	pi.if_pool_offset = 0;
 	pi.if_pool_objtotal = nmd->pools[NETMAP_IF_POOL].objtotal;
 	pi.if_pool_objsize = nmd->pools[NETMAP_IF_POOL]._objsize;
@@ -1900,6 +1898,7 @@ netmap_mem_pools_info_get(struct nmreq *nmr, struct netmap_adapter *na)
 			     nmd->pools[NETMAP_RING_POOL].memtotal;
 	pi.buf_pool_objtotal = nmd->pools[NETMAP_BUF_POOL].objtotal;
 	pi.buf_pool_objsize = nmd->pools[NETMAP_BUF_POOL]._objsize;
+	NMA_UNLOCK(nmd);
 
 	ret = copyout(&pi, upi, sizeof(pi));
 	if (ret) {
@@ -2291,6 +2290,7 @@ netmap_mem_pt_guest_find_memid(nm_memid_t mem_id)
 			((struct netmap_mem_ptg *)(scan))->host_mem_id == mem_id) {
 			mem = scan;
 			mem->refcount++;
+			NM_DBG_REFC(mem, __FUNCTION__, __LINE__);
 			break;
 		}
 		scan = scan->next;
