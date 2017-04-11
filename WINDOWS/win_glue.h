@@ -359,6 +359,7 @@ win32_ndis_packet_freem(struct mbuf* m)
 #define le64toh(x)		_byteswap_uint64(x)	//defined in intrin.h
 
 struct net_device* ifunit_ref(const char *name);
+void if_ref(struct net_device *ifp);
 void if_rele(struct net_device *ifp);
 
 PVOID send_up_to_stack(struct ifnet *ifp, struct mbuf *m, PVOID head);

@@ -886,6 +886,12 @@ bdg_mismatch_datapath(struct netmap_vp_adapter *na,
 }
 
 void
+if_ref(struct net_device *ifp)
+{
+
+}
+
+void
 if_rele(struct net_device *ifp)
 {
 	win32_clear_lookaside_buffers(ifp);
