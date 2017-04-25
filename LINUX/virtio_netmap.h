@@ -173,6 +173,12 @@ virtio_netmap_init_sgs(struct virtnet_info *vi)
 #endif /* VIRTIO_NOTIFY */
 
 
+struct netmap_virtio_adapter {
+	struct netmap_hw_adapter hwna; /* base class */
+	struct virtio_net_hdr_mrg_rxbuf shared_rxvhdr ____cacheline_aligned_in_smp;
+	struct virtio_net_hdr_mrg_rxbuf shared_txvhdr ____cacheline_aligned_in_smp;
+};
+
 static void
 virtio_netmap_clean_used_rings(struct virtnet_info *vi,
 			       struct netmap_adapter *na)
@@ -248,40 +254,17 @@ virtio_netmap_reclaim_unused(struct virtnet_info *vi)
 	}
 }
 
-/* Set or clear nr_pending_mode and nr_mode for all the rings, independently
- * of the specific user request. This is necessary for now because the
- * virtio-net driver patches do not support single-queue mode (modifications
- * would be needed to free_unused_bufs() free_receive_bufs()).*/
-static void
-virtio_netmap_set_kring_mode(struct netmap_adapter *na, int mode)
-{
-	int i;
-
-	for (i = 0; i < DEV_NUM_TX_QUEUES(na->ifp); i++) {
-		struct netmap_kring *kring = &na->tx_rings[i];
-
-		kring->nr_pending_mode = kring->nr_mode = mode;
-	}
-
-	for (i = 0; i < DEV_NUM_RX_QUEUES(na->ifp); i++) {
-		struct netmap_kring *kring = &na->rx_rings[i];
-
-		kring->nr_pending_mode = kring->nr_mode = mode;
-	}
-
-}
-
-static struct virtio_net_hdr_mrg_rxbuf *shared_tx_vnet_hdr;
-static struct virtio_net_hdr_mrg_rxbuf *shared_rx_vnet_hdr;
-
 /* Register and unregister. */
 static int
 virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 {
+	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct ifnet *ifp = na->ifp;
 	struct virtnet_info *vi = netdev_priv(ifp);
 	bool was_up = false;
 	int error = 0;
+	enum txrx t;
+	int i;
 
 	if (na == NULL)
 		return EINVAL;
@@ -291,6 +274,32 @@ virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 		 * mode. As a consequence, register (unregister) operations
 		 * only have effect with first (last) user.*/
 		return 0;
+	}
+
+	/* These virtio-net driver patches do not support single-queue mode
+	 * (modifications would be needed to free_unused_bufs()
+	 * free_receive_bufs()). As a result, we fail here if we detect
+	 * the user is trying to open only a subset of the rings. */
+	if (onoff) {
+		int hwrings_pending = 0;
+		int hwrings = nma_get_nrings(na, NR_TX) +
+				nma_get_nrings(na, NR_RX);
+
+		for_rx_tx(t) {
+			for (i = 0; i < nma_get_nrings(na, t); i++) {
+				struct netmap_kring *kring = &NMR(na, t)[i];
+
+				if (nm_kring_pending_on(kring)) {
+					hwrings_pending ++;
+				}
+			}
+		}
+
+		if (!(hwrings_pending == 0 || hwrings_pending == hwrings)) {
+			D("virtio-net native adapter can only open "
+			  "all RX and TX hw rings");
+			return EINVAL;
+		}
 	}
 
 	/* It's important to make sure each virtnet_close() matches
@@ -306,22 +315,8 @@ virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 		/* TX shared virtio-net header must be zeroed because its
 		 * content is exposed to the host. RX shared virtio-net
 		 * header is zeroed only for security reasons. */
-		BUG_ON(shared_tx_vnet_hdr);
-		BUG_ON(shared_rx_vnet_hdr);
-		shared_tx_vnet_hdr = kzalloc(sizeof(*shared_tx_vnet_hdr),
-						GFP_KERNEL);
-		if (!shared_tx_vnet_hdr) {
-			D("Failed to allocate TX shared vnet header");
-			return ENOMEM;
-		}
-		shared_rx_vnet_hdr = kzalloc(sizeof(*shared_rx_vnet_hdr),
-						GFP_KERNEL);
-		if (!shared_rx_vnet_hdr) {
-			kfree(shared_tx_vnet_hdr);
-			shared_tx_vnet_hdr = NULL;
-			D("Failed to allocate RX shared vnet header");
-			return ENOMEM;
-		}
+		memset(&vna->shared_txvhdr, 0, sizeof(vna->shared_txvhdr));
+		memset(&vna->shared_rxvhdr, 0, sizeof(vna->shared_rxvhdr));
 
 		/* Get and free any used buffers. This is necessary
 		 * before calling free_unused_bufs(), that uses
@@ -355,22 +350,33 @@ virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 		rtnl_lock();
 
 		/* enable netmap mode */
-		virtio_netmap_set_kring_mode(na, NKR_NETMAP_ON);
+		for_rx_tx(t) {
+			for (i = 0; i <= nma_get_nrings(na, t); i++) {
+				struct netmap_kring *kring = &NMR(na, t)[i];
+
+				if (nm_kring_pending_on(kring)) {
+					kring->nr_mode = NKR_NETMAP_ON;
+				}
+			}
+		}
 		nm_set_native_flags(na);
 	} else {
 		nm_clear_native_flags(na);
-		virtio_netmap_set_kring_mode(na, NKR_NETMAP_OFF);
+		for_rx_tx(t) {
+			for (i = 0; i <= nma_get_nrings(na, t); i++) {
+				struct netmap_kring *kring = &NMR(na, t)[i];
+
+				if (nm_kring_pending_off(kring)) {
+					kring->nr_mode = NKR_NETMAP_OFF;
+				}
+			}
+		}
 
 		/* Get and free any used buffer. This is necessary
 		 * before calling virtqueue_detach_unused_buf(). */
 		virtio_netmap_clean_used_rings(vi, na);
 
 		virtio_netmap_reclaim_unused(vi);
-
-		kfree(shared_tx_vnet_hdr);
-		shared_tx_vnet_hdr = NULL;
-		kfree(shared_rx_vnet_hdr);
-		shared_rx_vnet_hdr = NULL;
 	}
 
 	if (was_up) {
@@ -397,12 +403,13 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 
 	/* device-specific */
 	COMPAT_DECL_SG
+	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct virtnet_info *vi = netdev_priv(ifp);
 	struct virtqueue *vq = GET_TX_VQ(vi, ring_nr);
 	struct scatterlist *sg = GET_TX_SG(vi, ring_nr);
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(*shared_tx_vnet_hdr) :
-				sizeof(shared_tx_vnet_hdr->hdr);
+				sizeof(vna->shared_txvhdr) :
+				sizeof(vna->shared_txvhdr.hdr);
 	struct netmap_adapter *token;
 	int nospace = 0;
 
@@ -447,7 +454,7 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 			/* Initialize the scatterlist and expose it to
 			 * the hypervisor. */
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, shared_tx_vnet_hdr, vnet_hdr_len);
+			sg_set_buf(sg, &vna->shared_txvhdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, len);
 			nospace = virtqueue_add_outbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (nospace) {
@@ -495,12 +502,13 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 
 	/* device-specific */
 	COMPAT_DECL_SG
+	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct virtnet_info *vi = netdev_priv(ifp);
 	struct virtqueue *vq = GET_RX_VQ(vi, ring_nr);
 	struct scatterlist *sg = GET_RX_SG(vi, ring_nr);
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(*shared_rx_vnet_hdr) :
-				sizeof(shared_rx_vnet_hdr->hdr);
+				sizeof(vna->shared_rxvhdr) :
+				sizeof(vna->shared_rxvhdr.hdr);
 
 	/* XXX netif_carrier_ok ? */
 
@@ -575,7 +583,7 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 			/* Initialize the scatterlist and expose it to
 			 * the hypervisor. */
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, shared_rx_vnet_hdr, vnet_hdr_len);
+			sg_set_buf(sg, &vna->shared_rxvhdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, NETMAP_BUF_SIZE(na));
 			nospace = virtqueue_add_inbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (nospace) {
@@ -611,13 +619,15 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 {
 	struct ifnet *ifp = vi->dev;
 	struct netmap_adapter* na = NA(ifp);
+	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(*shared_rx_vnet_hdr) :
-				sizeof(shared_rx_vnet_hdr->hdr);
+				sizeof(vna->shared_rxvhdr) :
+				sizeof(vna->shared_rxvhdr.hdr);
 	unsigned int r;
 
 	if (!nm_native_on(na))
 		return 0;
+
 	for (r = 0; r < na->num_rx_rings; r++) {
 		COMPAT_DECL_SG
 		struct netmap_ring *ring = na->rx_rings[r].ring;
@@ -629,8 +639,7 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 
 		slot = netmap_reset(na, NR_RX, r, 0);
 		if (!slot) {
-			D("strange, null netmap ring %d", r);
-			return 0;
+			continue;
 		}
 
 		/* Add up to na>-num_rx_desc-1 buffers to this RX virtqueue.
@@ -643,7 +652,7 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 			slot = &ring->slot[i];
 			addr = NMB(na, slot);
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, shared_rx_vnet_hdr, vnet_hdr_len);
+			sg_set_buf(sg, &vna->shared_rxvhdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, NETMAP_BUF_SIZE(na));
 			err = virtqueue_add_inbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (err < 0) {
@@ -659,7 +668,6 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 		D("added %d inbufs on queue %d", i, r);
 		virtqueue_kick(vq);
 	}
-
 	return 1;
 }
 
@@ -689,6 +697,7 @@ static void
 virtio_netmap_attach(struct virtnet_info *vi)
 {
 	struct netmap_adapter na; /* temporary container of methods */
+	int ret;
 
 	bzero(&na, sizeof(na));
 
@@ -701,7 +710,11 @@ virtio_netmap_attach(struct virtnet_info *vi)
 	na.nm_rxsync = virtio_netmap_rxsync;
 	na.nm_config = virtio_netmap_config;
 
-	netmap_attach(&na);
+	ret = netmap_attach_ext(&na, sizeof(struct netmap_virtio_adapter));
+	if (ret) {
+		D("Failed to attach virtio-net interface");
+		return;
+	}
 
 	D("virtio attached txq=%d, txd=%d rxq=%d, rxd=%d",
 			na.num_tx_rings, na.num_tx_desc,

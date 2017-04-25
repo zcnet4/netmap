@@ -304,7 +304,7 @@ Available options:
   --cc=                        C compiler to be used for the apps [$cc]
   --ld=                        linker to be used for the apps [$ld]
   --prefix=                    install path for the apps [$prefix]
-  --destir=                    destination dir for the apps [$DESTDIR]
+  --destdir=                    destination dir for the apps [$DESTDIR]
 
   --show-drivers	       print the list of available drivers and exit
   --show-ext-drivers	       print the list of available external drivers and exit
@@ -1465,6 +1465,32 @@ EOF
  	 }
 EOF
   fi # ixgbe
+
+  if drv enabled ixgbevf; then
+
+  add_file_exists_check ixgbevf/ixgbevf.h true "drv_source_error ixgbevf"
+
+  # IXGBEVF_* or IXGBE_*?
+  add_test true 'define IXGBEVF_IXGBE_MACROS' <<EOF
+  	#include "ixgbevf/ixgbevf.h"
+
+	void *
+	dummy(struct ixgbevf_ring *ring, unsigned int i)
+	{
+		return IXGBEVF_RX_DESC(ring, i);
+	}
+EOF
+
+  # array of rings or array of poiners to rings?
+  add_test 'define IXGBEVF_PTR_ARRAY' <<EOF
+  	#include "ixgbevf/ixgbevf.h"
+  
+  	struct ixgbevf_ring *
+  	dummy(struct ixgbevf_adapter *adapter) {
+  		return adapter->tx_ring[0];
+  	}
+EOF
+  fi
 
   if drv enabled virtio_net.c; then
   

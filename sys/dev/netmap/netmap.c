@@ -2886,21 +2886,23 @@ netmap_hw_dtor(struct netmap_adapter *na)
 
 
 /*
- * Allocate a ``netmap_adapter`` object, and initialize it from the
+ * Allocate a netmap_adapter object, and initialize it from the
  * 'arg' passed by the driver on attach.
- * We allocate a block of memory with room for a struct netmap_adapter
- * plus two sets of N+2 struct netmap_kring (where N is the number
- * of hardware rings):
- * krings	0..N-1	are for the hardware queues.
- * kring	N	is for the host stack queue
- * kring	N+1	is only used for the selinfo for all queues. // XXX still true ?
+ * We allocate a block of memory of 'size' bytes, which has room
+ * for struct netmap_adapter plus additional room private to
+ * the caller.
  * Return 0 on success, ENOMEM otherwise.
  */
-static int
-_netmap_attach(struct netmap_adapter *arg, size_t size)
+int
+netmap_attach_ext(struct netmap_adapter *arg, size_t size)
 {
 	struct netmap_hw_adapter *hwna = NULL;
 	struct ifnet *ifp = NULL;
+
+	if (size < sizeof(struct netmap_hw_adapter)) {
+		D("Invalid netmap adapter size %d", (int)size);
+		return EINVAL;
+	}
 
 	if (arg == NULL || arg->ifp == NULL)
 		goto fail;
@@ -2960,45 +2962,8 @@ fail:
 int
 netmap_attach(struct netmap_adapter *arg)
 {
-	return _netmap_attach(arg, sizeof(struct netmap_hw_adapter));
+	return netmap_attach_ext(arg, sizeof(struct netmap_hw_adapter));
 }
-
-
-#ifdef WITH_PTNETMAP_GUEST
-int
-netmap_pt_guest_attach(struct netmap_adapter *arg, void *csb,
-		       unsigned int nifp_offset, unsigned int memid)
-{
-	struct netmap_pt_guest_adapter *ptna;
-	struct ifnet *ifp = arg ? arg->ifp : NULL;
-	int error;
-
-	/* get allocator */
-	arg->nm_mem = netmap_mem_pt_guest_new(ifp, nifp_offset, memid);
-	if (arg->nm_mem == NULL)
-		return ENOMEM;
-	arg->na_flags |= NAF_MEM_OWNER;
-	error = _netmap_attach(arg, sizeof(struct netmap_pt_guest_adapter));
-	if (error)
-		return error;
-
-	/* get the netmap_pt_guest_adapter */
-	ptna = (struct netmap_pt_guest_adapter *) NA(ifp);
-	ptna->csb = csb;
-
-	/* Initialize a separate pass-through netmap adapter that is going to
-	 * be used by the ptnet driver only, and so never exposed to netmap
-         * applications. We only need a subset of the available fields. */
-	memset(&ptna->dr, 0, sizeof(ptna->dr));
-	ptna->dr.up.ifp = ifp;
-	ptna->dr.up.nm_mem = netmap_mem_get(ptna->hwup.up.nm_mem);
-        ptna->dr.up.nm_config = ptna->hwup.up.nm_config;
-
-	ptna->backend_regifs = 0;
-
-	return 0;
-}
-#endif /* WITH_PTNETMAP_GUEST */
 
 
 void
